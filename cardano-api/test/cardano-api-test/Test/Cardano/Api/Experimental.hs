@@ -25,6 +25,7 @@ import Cardano.Ledger.Address qualified as L
 import Cardano.Ledger.Alonzo.Scripts qualified as UnexportedLedger
 import Cardano.Ledger.Api qualified as UnexportedLedger
 import Cardano.Ledger.Babbage.TxBody qualified as L
+import Cardano.Ledger.Mary.Value qualified as Mary
 import Cardano.Ledger.Conway qualified as L
 import Cardano.Ledger.Core qualified as L
 import Cardano.Ledger.Credential qualified as L
@@ -89,6 +90,15 @@ tests =
         , testProperty
             "underfunded transaction (outputs exceed inputs) always fails"
             prop_calcMinFeeRecursive_insufficient_funds
+        , testProperty
+            "Case 2: outputs with tokens not in UTxO returns NonAdaAssetsUnbalanced"
+            prop_calcMinFeeRecursive_non_ada_unbalanced
+        , testProperty
+            "Case 3: output with multi-assets below min UTxO returns MinUTxONotMet"
+            prop_calcMinFeeRecursive_min_utxo_not_met
+        , testProperty
+            "Case 4: transaction with no outputs returns NoTxOuts"
+            prop_calcMinFeeRecursive_no_tx_outs
         ]
     ]
 
@@ -184,7 +194,7 @@ prop_balance_transaction_two_ways = H.propertyOnce $ do
 
       dummyUTxO = L.UTxO $ Map.singleton dummyTxIn dummyLargeTxOut
   Exp.UnsignedTx recFeeTx <-
-    H.evalEither $ Exp.calcMinFeeRecursive unSignTx dummyUTxO exampleProtocolParams 0
+    H.evalEither $ Exp.calcMinFeeRecursive unSignTx dummyUTxO exampleProtocolParams mempty mempty mempty 0
   let recFee = recFeeTx ^. (L.bodyTxL . L.feeTxBodyL)
   H.note_ $ "Fees 1: " <> show oldFees
 
@@ -599,7 +609,7 @@ genUnderfundedTx era = do
 prop_calcMinFeeRecursive_well_funded_succeeds :: Property
 prop_calcMinFeeRecursive_well_funded_succeeds = H.property $ do
   (unsignedTx, utxo) <- H.forAll $ genFundedSimpleTx Exp.ConwayEra
-  case Exp.calcMinFeeRecursive unsignedTx utxo exampleProtocolParams 0 of
+  case Exp.calcMinFeeRecursive unsignedTx utxo exampleProtocolParams mempty mempty mempty 0 of
     Left err -> H.annotateShow err >> H.failure
     Right (Exp.UnsignedTx resultLedgerTx) -> do
       let resultFee = resultLedgerTx ^. L.bodyTxL . L.feeTxBodyL
@@ -611,12 +621,12 @@ prop_calcMinFeeRecursive_well_funded_succeeds = H.property $ do
 prop_calcMinFeeRecursive_fee_fixpoint :: Property
 prop_calcMinFeeRecursive_fee_fixpoint = H.property $ do
   (unsignedTx, utxo) <- H.forAll $ genFundedSimpleTx Exp.ConwayEra
-  case Exp.calcMinFeeRecursive unsignedTx utxo exampleProtocolParams 0 of
+  case Exp.calcMinFeeRecursive unsignedTx utxo exampleProtocolParams mempty mempty mempty 0 of
     Left _ -> H.success
     Right resultTx -> do
       secondResult <-
         H.evalEither $
-          Exp.calcMinFeeRecursive resultTx utxo exampleProtocolParams 0
+          Exp.calcMinFeeRecursive resultTx utxo exampleProtocolParams mempty mempty mempty 0
       resultTx H.=== secondResult
 
 -- | When the outputs exceed the UTxO value the function returns
@@ -624,7 +634,161 @@ prop_calcMinFeeRecursive_fee_fixpoint = H.property $ do
 prop_calcMinFeeRecursive_insufficient_funds :: Property
 prop_calcMinFeeRecursive_insufficient_funds = H.property $ do
   (unsignedTx, utxo) <- H.forAll $ genUnderfundedTx Exp.ConwayEra
-  case Exp.calcMinFeeRecursive unsignedTx utxo exampleProtocolParams 0 of
+  case Exp.calcMinFeeRecursive unsignedTx utxo exampleProtocolParams mempty mempty mempty 0 of
     Left (Exp.NotEnoughAda deficit) -> H.assert $ deficit < L.Coin 0
+    Left Exp.NonAdaAssetsUnbalanced{} -> H.annotate "Unexpected NonAdaAssetsUnbalanced error" >> H.failure
+    Left Exp.MinUTxONotMet{} -> H.annotate "Unexpected MinUTxONotMet error" >> H.failure
     Left Exp.NoTxOuts -> H.annotate "Unexpected NoTxOuts error" >> H.failure
+    Left Exp.FeeCalculationDidNotConverge -> H.annotate "Unexpected FeeCalculationDidNotConverge error" >> H.failure
     Right _ -> H.failure
+
+-- | Generates a transaction whose output demands a native token that does
+-- not exist in the UTxO (which is ADA-only). This guarantees a negative
+-- multi-asset balance, triggering Case 2 ('NonAdaAssetsUnbalanced').
+genNonAdaUnbalancedTx
+  :: Exp.Era era
+  -> Gen
+       ( Exp.UnsignedTx (Exp.LedgerEra era)
+       , L.UTxO (Exp.LedgerEra era)
+       )
+genNonAdaUnbalancedTx era = do
+  let sbe = convert era
+  txIn <- genTxIn
+  addr <- Api.toShelleyAddr <$> genAddressInEra sbe
+  fundingCoin <- L.Coin <$> Gen.integral (Range.linear 5_000_000 20_000_000)
+  sendCoin <- L.Coin <$> Gen.integral (Range.linear 1_000_000 3_000_000)
+  tokenQty <- Gen.integral (Range.linear 1 1_000_000)
+  let ledgerTxIn = Api.toShelleyTxIn txIn
+      fundingTxOut =
+        Exp.obtainCommonConstraints era $
+          L.mkBasicTxOut addr (L.MaryValue fundingCoin mempty)
+      utxo = L.UTxO $ Map.singleton ledgerTxIn fundingTxOut
+      -- Output demands tokens that don't exist in the ADA-only UTxO
+      policyId = L.PolicyID $ L.ScriptHash "1c14ee8e58fbcbd48dc7367c95a63fd1d937ba989820015db16ac7e5"
+      sendValue =
+        L.MaryValue sendCoin $
+          L.MultiAsset $
+            Map.singleton policyId (Map.singleton (Mary.AssetName "testtoken") tokenQty)
+      sendTxOut =
+        Exp.obtainCommonConstraints era $
+          Exp.TxOut $
+            Exp.obtainCommonConstraints era $
+              Ledger.mkBasicTxOut addr sendValue
+      txBodyContent =
+        Exp.defaultTxBodyContent
+          & Exp.setTxIns [(txIn, Exp.AnyKeyWitnessPlaceholder)]
+          & Exp.setTxOuts [sendTxOut]
+          & Exp.setTxFee 0
+  return (Exp.makeUnsignedTx era txBodyContent, utxo)
+
+-- | Generates a two-output transaction where the second output carries native
+-- tokens with only 1000 lovelace — well below the minimum UTxO for a
+-- token-bearing output. The surplus ADA is distributed to the first
+-- output (Case 4), so the second output stays below minimum, triggering
+-- Case 3 ('MinUTxONotMet').
+genMinUTxOViolatingTx
+  :: Exp.Era era
+  -> Gen
+       ( Exp.UnsignedTx (Exp.LedgerEra era)
+       , L.UTxO (Exp.LedgerEra era)
+       )
+genMinUTxOViolatingTx era = do
+  let sbe = convert era
+  txIn <- genTxIn
+  addr <- Api.toShelleyAddr <$> genAddressInEra sbe
+  tokenQty <- Gen.integral (Range.linear 1 1_000_000)
+  let policyId = L.PolicyID $ L.ScriptHash "1c14ee8e58fbcbd48dc7367c95a63fd1d937ba989820015db16ac7e5"
+      multiAsset = L.MultiAsset $ Map.singleton policyId (Map.singleton (Mary.AssetName "testtoken") tokenQty)
+      -- UTxO has plenty of ADA and the same tokens
+      fundingValue = L.MaryValue (L.Coin 5_000_000) multiAsset
+      ledgerTxIn = Api.toShelleyTxIn txIn
+      fundingTxOut =
+        Exp.obtainCommonConstraints era $
+          L.mkBasicTxOut addr fundingValue
+      utxo = L.UTxO $ Map.singleton ledgerTxIn fundingTxOut
+      -- Output 1: ADA only, will receive surplus via balanceTxOuts
+      sendTxOut1 =
+        Exp.obtainCommonConstraints era $
+          Exp.TxOut $
+            Exp.obtainCommonConstraints era $
+              Ledger.mkBasicTxOut addr (L.MaryValue (L.Coin 1_000_000) mempty)
+      -- Output 2: tokens with tiny ADA (below min UTxO)
+      sendTxOut2 =
+        Exp.obtainCommonConstraints era $
+          Exp.TxOut $
+            Exp.obtainCommonConstraints era $
+              Ledger.mkBasicTxOut addr (L.MaryValue (L.Coin 1_000) multiAsset)
+      txBodyContent =
+        Exp.defaultTxBodyContent
+          & Exp.setTxIns [(txIn, Exp.AnyKeyWitnessPlaceholder)]
+          & Exp.setTxOuts [sendTxOut1, sendTxOut2]
+          & Exp.setTxFee 0
+  return (Exp.makeUnsignedTx era txBodyContent, utxo)
+
+-- | Generates a transaction with inputs but no outputs. Once the fee
+-- converges (Case 5), the positive surplus triggers Case 4, and
+-- 'balanceTxOuts' returns 'NoTxOuts'.
+genNoOutputsTx
+  :: Exp.Era era
+  -> Gen
+       ( Exp.UnsignedTx (Exp.LedgerEra era)
+       , L.UTxO (Exp.LedgerEra era)
+       )
+genNoOutputsTx era = do
+  let sbe = convert era
+  txIn <- genTxIn
+  addr <- Api.toShelleyAddr <$> genAddressInEra sbe
+  fundingCoin <- L.Coin <$> Gen.integral (Range.linear 5_000_000 20_000_000)
+  let ledgerTxIn = Api.toShelleyTxIn txIn
+      fundingTxOut =
+        Exp.obtainCommonConstraints era $
+          L.mkBasicTxOut addr (L.MaryValue fundingCoin mempty)
+      utxo = L.UTxO $ Map.singleton ledgerTxIn fundingTxOut
+      txBodyContent =
+        Exp.defaultTxBodyContent
+          & Exp.setTxIns [(txIn, Exp.AnyKeyWitnessPlaceholder)]
+          & Exp.setTxOuts [] -- No outputs!
+          & Exp.setTxFee 0
+  return (Exp.makeUnsignedTx era txBodyContent, utxo)
+
+-- | When the output demands tokens not present in the ADA-only UTxO,
+-- the function returns 'Left (NonAdaAssetsUnbalanced _)'.
+prop_calcMinFeeRecursive_non_ada_unbalanced :: Property
+prop_calcMinFeeRecursive_non_ada_unbalanced = H.property $ do
+  (unsignedTx, utxo) <- H.forAll $ genNonAdaUnbalancedTx Exp.ConwayEra
+  case Exp.calcMinFeeRecursive unsignedTx utxo exampleProtocolParams mempty mempty mempty 0 of
+    Left (Exp.NonAdaAssetsUnbalanced _) -> H.success
+    Left Exp.NotEnoughAda{} -> H.annotate "Unexpected NotEnoughAda" >> H.failure
+    Left Exp.MinUTxONotMet{} -> H.annotate "Unexpected MinUTxONotMet" >> H.failure
+    Left Exp.NoTxOuts -> H.annotate "Unexpected NoTxOuts" >> H.failure
+    Left Exp.FeeCalculationDidNotConverge -> H.annotate "Unexpected FeeCalculationDidNotConverge" >> H.failure
+    Right _ -> H.annotate "Expected NonAdaAssetsUnbalanced but got Right" >> H.failure
+
+-- | When a token-bearing output has less ADA than the minimum UTxO,
+-- the function returns 'Left (MinUTxONotMet actual required)' with
+-- @actual < required@.
+prop_calcMinFeeRecursive_min_utxo_not_met :: Property
+prop_calcMinFeeRecursive_min_utxo_not_met = H.property $ do
+  (unsignedTx, utxo) <- H.forAll $ genMinUTxOViolatingTx Exp.ConwayEra
+  case Exp.calcMinFeeRecursive unsignedTx utxo exampleProtocolParams mempty mempty mempty 0 of
+    Left (Exp.MinUTxONotMet actual required) -> do
+      H.annotate $ "Actual: " <> show actual <> ", Required: " <> show required
+      H.assert $ actual < required
+    Left Exp.NotEnoughAda{} -> H.annotate "Unexpected NotEnoughAda" >> H.failure
+    Left Exp.NonAdaAssetsUnbalanced{} -> H.annotate "Unexpected NonAdaAssetsUnbalanced" >> H.failure
+    Left Exp.NoTxOuts -> H.annotate "Unexpected NoTxOuts" >> H.failure
+    Left Exp.FeeCalculationDidNotConverge -> H.annotate "Unexpected FeeCalculationDidNotConverge" >> H.failure
+    Right _ -> H.annotate "Expected MinUTxONotMet but got Right" >> H.failure
+
+-- | When the transaction has no outputs, the surplus distribution in
+-- Case 4 returns 'Left NoTxOuts'.
+prop_calcMinFeeRecursive_no_tx_outs :: Property
+prop_calcMinFeeRecursive_no_tx_outs = H.property $ do
+  (unsignedTx, utxo) <- H.forAll $ genNoOutputsTx Exp.ConwayEra
+  case Exp.calcMinFeeRecursive unsignedTx utxo exampleProtocolParams mempty mempty mempty 0 of
+    Left Exp.NoTxOuts -> H.success
+    Left Exp.NotEnoughAda{} -> H.annotate "Unexpected NotEnoughAda" >> H.failure
+    Left Exp.NonAdaAssetsUnbalanced{} -> H.annotate "Unexpected NonAdaAssetsUnbalanced" >> H.failure
+    Left Exp.MinUTxONotMet{} -> H.annotate "Unexpected MinUTxONotMet" >> H.failure
+    Left Exp.FeeCalculationDidNotConverge -> H.annotate "Unexpected FeeCalculationDidNotConverge" >> H.failure
+    Right _ -> H.annotate "Expected NoTxOuts but got Right" >> H.failure

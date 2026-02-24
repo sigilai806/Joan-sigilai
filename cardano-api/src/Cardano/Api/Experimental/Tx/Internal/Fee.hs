@@ -13,7 +13,7 @@
 {-# LANGUAGE TypeApplications #-}
 
 module Cardano.Api.Experimental.Tx.Internal.Fee
-  ( RecursiveFeeCalculationError (..)
+  ( FeeCalculationError (..)
   , TxBodyErrorAutoBalance (..)
   , TxFeeEstimationError (..)
   , calculateMinimumUTxO
@@ -660,54 +660,175 @@ evaluateTransactionFee
 evaluateTransactionFee pp (UnsignedTx tx) keywitcount byronwitcount refScriptsSize =
   L.estimateMinFeeTx pp tx (fromIntegral keywitcount) (fromIntegral byronwitcount) refScriptsSize
 
-data RecursiveFeeCalculationError
+data FeeCalculationError
   = NotEnoughAda Coin
+  | NonAdaAssetsUnbalanced L.MultiAsset
+  | MinUTxONotMet L.Coin L.Coin
+  -- ^ @MinUTxONotMet actual required@: an output does not meet the minimum UTxO requirement.
   | NoTxOuts
+  | FeeCalculationDidNotConverge
   deriving (Show, Eq)
 
-instance Error RecursiveFeeCalculationError where
+instance Error FeeCalculationError where
   prettyError (NotEnoughAda balance) =
     mconcat
       [ "The transaction balance is negative: "
       , pretty balance
       , "\nThis means that the transaction does not have enough ada to cover the fees. The usual solution is to provide more inputs, or inputs with more ada."
       ]
+  prettyError (NonAdaAssetsUnbalanced multiAsset) =
+    mconcat
+      [ "Non-ADA assets are unbalanced: "
+      , pshow multiAsset
+      , "\nThe transaction inputs and minted values do not match the outputs for one or more native tokens."
+      ]
+  prettyError (MinUTxONotMet actual required) =
+    mconcat
+      [ "An output does not meet the minimum UTxO requirement."
+      , "\nActual ADA in output: " <> pretty actual
+      , "\nMinimum required: " <> pretty required
+      , "\nThe usual solution is to provide more ADA inputs to cover the minimum UTxO for outputs carrying native tokens."
+      ]
   prettyError NoTxOuts =
     "The transaction has no outputs. At least one output is required to balance the transaction."
+  prettyError FeeCalculationDidNotConverge =
+    "Fee calculation did not converge after the maximum number of iterations."
 
+-- | Recursively calculate the minimum fee for a transaction and balance it.
+--
+-- Starting from the provided transaction, this function iteratively adjusts
+-- the fee field and output values until the transaction is fully balanced
+-- (i.e. @inputs + mint + withdrawals + refunds = outputs + fee + deposits@
+-- for all value components: ADA and every native token).
+--
+-- On each iteration the balance is computed via 'evaluateTransactionBalance'
+-- and the minimum fee via @calcMinFeeTx@. The function then proceeds based
+-- on the following cases, evaluated in order:
+--
+-- * __Case 1 – Negative ADA balance__: The inputs do not cover the outputs,
+--   fee, and deposits. This is unrecoverable because fee adjustments can only
+--   increase the fee (making the deficit worse). Remedy: provide additional
+--   ADA inputs or reduce the outputs.
+--   Returns 'NotEnoughAda'.
+--
+-- * __Case 2 – Negative multi-asset balance__: The outputs demand more of a
+--   native token than is available from inputs and minting. This is
+--   unrecoverable because fee adjustments only affect ADA — they cannot
+--   change the multi-asset balance. Remedy: provide additional inputs
+--   containing the deficit tokens, mint the missing amount, or reduce the
+--   token quantities in the outputs.
+--   Returns 'NonAdaAssetsUnbalanced'.
+--
+-- * __Case 3 – Fee converged, balance is zero__: The transaction is fully
+--   balanced. Before returning, all outputs are checked against the minimum
+--   UTxO requirement ('MinUTxONotMet'). Note: a 'MinUTxONotMet' error at
+--   this point typically means that Case 4 distributed surplus multi-assets
+--   to an output on a prior iteration but there was not enough ADA surplus
+--   to satisfy the increased @coinPerUTxOByte@ requirement for that output.
+--   The remedy is the same as Case 1: provide additional ADA inputs.
+--
+-- * __Case 4 – Fee converged, non-negative non-zero surplus__: There is
+--   excess ADA, excess multi-assets (e.g. from minting), or both. The
+--   surplus is distributed to the first output and the function recurses,
+--   because the larger output may increase the transaction size and
+--   therefore the required fee, and must also satisfy the minimum UTxO
+--   (@coinPerUTxOByte@) constraint.
+--
+-- * __Case 5 – Fee has not converged__: The fee field is set to the newly
+--   computed minimum fee and the function recurses.
+--
+-- A maximum iteration limit (currently 50) guards against non-termination.
+-- In practice convergence occurs within 2–3 iterations.
 calcMinFeeRecursive
   :: forall era
    . IsEra era
   => UnsignedTx (LedgerEra era)
   -> L.UTxO (LedgerEra era)
   -> L.PParams (LedgerEra era)
+  -> Set PoolId
+  -- ^ The set of registered stake pools. Pool registrations for pools
+  -- already in this set are treated as re-registrations (no deposit
+  -- required on the produced side).
+  -> Map StakeCredential L.Coin
+  -- ^ Deposits for stake credentials being deregistered in this
+  -- transaction. These are counted as refunds on the consumed side.
+  -> Map (Ledger.Credential Ledger.DRepRole) L.Coin
+  -- ^ Deposits for DRep credentials being deregistered in this
+  -- transaction. These are counted as refunds on the consumed side.
   -> Int
   -- ^ Number of extra key hashes for native scripts
-  -> Either RecursiveFeeCalculationError (UnsignedTx (LedgerEra era))
-calcMinFeeRecursive unSignTx@(UnsignedTx ledgerTx) utxo pparams nExtraWitnesses
-  | minFee == txBodyFee && L.isZero txBalanceCoin =
-      -- We have reached the minimum fee but there isn't a guarantee that
-      -- the inputs/outputs are balanced
-      return unSignTx
-  | minFee == txBodyFee && txBalanceCoin > 0 = do
-      -- We have a surplus balance so we modify the outputs to include it.
-      balancedOuts <- balanceTxOuts txBalanceValue unSignTx
-      let updatedTx = UnsignedTx (ledgerTx & L.bodyTxL . L.outputsTxBodyL .~ Seq.fromList balancedOuts)
-       in return updatedTx
-  | txBalanceCoin < 0 = Left $ NotEnoughAda txBalanceCoin
-  | otherwise =
-      let newTx = UnsignedTx (ledgerTx & L.bodyTxL . L.feeTxBodyL .~ minFee)
-       in calcMinFeeRecursive newTx utxo pparams nExtraWitnesses
+  -> Either FeeCalculationError (UnsignedTx (LedgerEra era))
+calcMinFeeRecursive = go maxIterations
  where
-  minFee = obtainCommonConstraints (useEra @era) $ L.calcMinFeeTx utxo pparams ledgerTx nExtraWitnesses
-  txBodyFee = ledgerTx ^. L.bodyTxL . L.feeTxBodyL
-  txBalanceValue = evaluateTransactionBalance pparams mempty mempty mempty utxo unSignTx
-  txBalanceCoin = L.coin txBalanceValue
+  maxIterations :: Int
+  maxIterations = 50
+
+  go
+    :: Int
+    -> UnsignedTx (LedgerEra era)
+    -> L.UTxO (LedgerEra era)
+    -> L.PParams (LedgerEra era)
+    -> Set PoolId
+    -> Map StakeCredential L.Coin
+    -> Map (Ledger.Credential Ledger.DRepRole) L.Coin
+    -> Int
+    -> Either FeeCalculationError (UnsignedTx (LedgerEra era))
+  go 0 _ _ _ _ _ _ _ = Left FeeCalculationDidNotConverge
+  go n unSignTx@(UnsignedTx ledgerTx) utxo pparams poolids stakeDelegDeposits drepDelegDeposits nExtraWitnesses
+    | txBalanceCoin < 0 =
+        -- Case 1
+        Left $ NotEnoughAda txBalanceCoin
+    | multiAssetIsNegative =
+        -- Case 2
+        Left $ NonAdaAssetsUnbalanced (getMultiAssets (useEra @era) txBalanceValue)
+    | minFee == txBodyFee && L.isZero txBalanceValue = do
+        -- Case 3
+        let outs = toList $ ledgerTx ^. L.bodyTxL . L.outputsTxBodyL
+        mapM_ (checkOutputMinUTxO pparams) outs
+        return unSignTx
+    | minFee == txBodyFee = do
+        -- Case 4
+        balancedOuts <- balanceTxOuts txBalanceValue unSignTx
+        let updatedTx = UnsignedTx (ledgerTx & L.bodyTxL . L.outputsTxBodyL .~ Seq.fromList balancedOuts)
+        go (n - 1) updatedTx utxo pparams poolids stakeDelegDeposits drepDelegDeposits nExtraWitnesses
+    | otherwise =
+        -- Case 5
+        let newTx = UnsignedTx (ledgerTx & L.bodyTxL . L.feeTxBodyL .~ minFee)
+         in go (n - 1) newTx utxo pparams poolids stakeDelegDeposits drepDelegDeposits nExtraWitnesses
+   where
+    minFee = obtainCommonConstraints (useEra @era) $ L.calcMinFeeTx utxo pparams ledgerTx nExtraWitnesses
+    txBodyFee = ledgerTx ^. L.bodyTxL . L.feeTxBodyL
+    txBalanceValue = evaluateTransactionBalance pparams poolids stakeDelegDeposits drepDelegDeposits utxo unSignTx
+    txBalanceCoin = L.coin txBalanceValue
+    multiAssetIsNegative =
+      obtainCommonConstraints (useEra @era) $
+        not (L.pointwise (>=) txBalanceValue (L.inject txBalanceCoin))
+
+checkOutputMinUTxO
+  :: forall era
+   . IsEra era
+  => Ledger.PParams (LedgerEra era)
+  -> L.TxOut (LedgerEra era)
+  -> Either FeeCalculationError ()
+checkOutputMinUTxO pp out =
+  obtainCommonConstraints (useEra @era) $
+    let txout = TxOut out
+     in case checkMinUTxOValue pp txout of
+          Right () -> Right ()
+          Left (TxOut offending, minRequired) ->
+            Left $ MinUTxONotMet (offending ^. L.coinTxOutL) minRequired
+
+getMultiAssets :: Era era -> L.Value (LedgerEra era) -> L.MultiAsset
+getMultiAssets era val = case era of
+  DijkstraEra -> mempty
+  ConwayEra ->
+    let L.MaryValue _ ma = val
+     in ma
 
 balanceTxOuts
   :: L.Value (LedgerEra era)
   -> UnsignedTx (LedgerEra era)
-  -> Either RecursiveFeeCalculationError [L.TxOut (LedgerEra era)]
+  -> Either FeeCalculationError [L.TxOut (LedgerEra era)]
 balanceTxOuts txBalance (UnsignedTx tx) =
   let outs = toList $ tx ^. L.bodyTxL . L.outputsTxBodyL
    in case List.uncons outs of
