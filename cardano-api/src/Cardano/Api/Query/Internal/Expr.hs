@@ -41,6 +41,7 @@ module Cardano.Api.Query.Internal.Expr
   , queryProposals
   , queryStakePoolDefaultVote
   , queryLedgerConfig
+  , queryDRepDelegations
   )
 where
 
@@ -68,7 +69,7 @@ import Cardano.Slotting.Slot
 import Ouroboros.Consensus.Cardano.Block qualified as Consensus
 import Ouroboros.Consensus.HardFork.Combinator.AcrossEras as Consensus
 import Ouroboros.Network.Block (Serialised)
-import Ouroboros.Network.PeerSelection.LedgerPeers (LedgerPeerSnapshot)
+import Ouroboros.Network.PeerSelection.LedgerPeers (LedgerPeersKind, SomeLedgerPeerSnapshot)
 
 import Data.Map (Map)
 import Data.Sequence (Seq)
@@ -153,14 +154,15 @@ queryDebugLedgerState eon = querySbe eon QueryDebugLedgerState
 queryLedgerPeerSnapshot
   :: ()
   => ShelleyBasedEra era
+  -> LedgerPeersKind
   -> LocalStateQueryExpr
        block
        point
        QueryInMode
        r
        IO
-       (Either UnsupportedNtcVersionError (Either EraMismatch (Serialised LedgerPeerSnapshot)))
-queryLedgerPeerSnapshot eon = querySbe eon QueryLedgerPeerSnapshot
+       (Either UnsupportedNtcVersionError (Either EraMismatch (Serialised SomeLedgerPeerSnapshot)))
+queryLedgerPeerSnapshot eon = querySbe eon . QueryLedgerPeerSnapshot
 
 queryEraHistory
   :: ()
@@ -429,7 +431,7 @@ queryDRepStakeDistribution eon = querySbe eon . QueryDRepStakeDistr
 
 querySPOStakeDistribution
   :: ConwayEraOnwards era
-  -> Set (L.KeyHash 'L.StakePool)
+  -> Set (L.KeyHash L.StakePool)
   -- ^ An empty SPO key hash set means that distributions for all SPOs will be returned
   -> LocalStateQueryExpr
        block
@@ -439,7 +441,7 @@ querySPOStakeDistribution
        IO
        ( Either
            UnsupportedNtcVersionError
-           (Either EraMismatch (Map (L.KeyHash 'L.StakePool) L.Coin))
+           (Either EraMismatch (Map (L.KeyHash L.StakePool) L.Coin))
        )
 querySPOStakeDistribution eon = querySbe eon . QuerySPOStakeDistr
 
@@ -507,7 +509,7 @@ queryProposals eon = querySbe eon . QueryProposals
 queryStakePoolDefaultVote
   :: forall era block point r
    . ConwayEraOnwards era
-  -> L.KeyHash 'L.StakePool
+  -> L.KeyHash L.StakePool
   -> LocalStateQueryExpr
        block
        point
@@ -519,6 +521,22 @@ queryStakePoolDefaultVote
            (Either EraMismatch L.DefaultVote)
        )
 queryStakePoolDefaultVote eon = querySbe eon . QueryStakePoolDefaultVote
+
+queryDRepDelegations
+  :: forall era block point r
+   . ConwayEraOnwards era
+  -> Set L.DRep
+  -> LocalStateQueryExpr
+       block
+       point
+       QueryInMode
+       r
+       IO
+       ( Either
+           UnsupportedNtcVersionError
+           (Either EraMismatch (Map L.DRep (Set (L.Credential L.Staking))))
+       )
+queryDRepDelegations eon = querySbe eon . GetDRepDelegations
 
 querySbe
   :: Convert eon ShelleyBasedEra
