@@ -1,0 +1,115 @@
+#!/usr/bin/env bash
+
+# Function to display help message
+show_help() {
+    echo "Usage: format <OPTION|FILES>"
+    echo "Format Haskell source files using fourmolu and stylish-haskell."
+    echo ""
+    echo "Options:"
+    echo "  -t, --tracked           Format all tracked Haskell (*.hs) files in the repository"
+    echo "  -s, --staged            Format all staged Haskell (*.hs) files"
+    echo "  -m, --modified          Format all modified Haskell (*.hs) files, including staged and unstaged"
+    echo "  -n, --not-staged        Format all non-staged modified Haskell (*.hs) files"
+    echo "  -p, --previous-commit   Format all Haskell (*.hs) files modified before the last commit (HEAD~1)"
+    echo "  -h, --help              Show this help message"
+}
+
+# https://no-color.org/
+if [[ -z "$NO_COLOR" ]]; then
+  green_colour="\033[0;32m"
+  blue_colour="\033[0;34m"
+  orange_colour="\033[0;33m"
+  reset_colour="\033[0m"
+else
+  green_colour=""
+  blue_colour=""
+  orange_colour=""
+  reset_colour=""
+fi
+
+# Function to run the formatting commands
+run_format() {
+    top_level=$(git rev-parse --show-toplevel)
+    for file in "$@"; do
+        if [[ $file == *.hs ]]; then
+            relative_path=$(realpath --relative-to="$top_level" "$file")
+            if grep -qE '^#' "$top_level/$relative_path"; then
+              echo -e "${orange_colour}${relative_path} contains CPP. Skipping.${reset_colour}"
+            else
+              echo -e "${green_colour}Formatting: ${blue_colour}${relative_path}${reset_colour}"
+              fourmolu -q -i "$top_level/$relative_path"
+              fourmolu -q -i "$top_level/$relative_path"
+              stylish-haskell -i "$top_level/$relative_path"
+            fi
+        fi
+    done
+}
+
+flag_passed="true"
+
+# Parse command line arguments
+case $1 in
+    -t|--tracked)
+        files=$(git ls-files '*.hs')
+        ;;
+    -s|--staged)
+        files=$(git diff --cached --name-only --diff-filter=ACM '*.hs')
+        ;;
+    -m|--modified)
+        files=$(git diff --name-only --diff-filter=ACM HEAD '*.hs')
+        ;;
+    -n|--not-staged)
+        files=$(git diff --name-only --diff-filter=ACM '*.hs')
+        ;;
+    -p|--previous-commit)
+        files=$(git diff --name-only --diff-filter=ACM HEAD~1 '*.hs')
+        ;;
+    -h|--help)
+        show_help
+        exit 0
+        ;;
+    *)
+        files="$@"
+        flag_passed="false"
+        ;;
+esac
+
+if [[ $flag_passed == "true" ]] && [[ $# -gt 1 ]]; then
+  echo "ERROR: only one flag is allowed!"
+  echo -e
+  show_help
+  exit 1
+fi
+
+for file in $files; do
+  if [[ ! -a $file ]]; then
+    echo "ERROR: $file does not exist"
+    exit 1
+  elif ! [[ -f $file ]]; then
+    echo "ERROR: $file is not a regular file"
+    exit
+  fi
+done
+
+for tool in stylish-haskell fourmolu
+do
+  if ! (which $tool > /dev/null 2>&1); then
+    echo "ERROR: $tool is not available!"
+    echo -e
+    echo "Try entering the development shell with:"
+    echo "  nix develop"
+    exit 1
+  fi
+done
+
+if [[ -z $files ]]; then
+    echo "No files to format!"
+    if [[ -z $1 ]]; then
+      echo -e
+      show_help
+      exit 1
+    fi
+fi
+
+run_format $files
+
